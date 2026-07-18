@@ -1,0 +1,10 @@
+*.pt
+*.npy
+*.png
+*.pth
+runs/
+__pycache__/
+*.jpg
+*.out
+*.err
+*.pyc
