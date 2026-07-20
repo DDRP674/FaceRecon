@@ -16,6 +16,20 @@ class CelebARecord:
     identity: int | None = None
 
 
+IDENTITY_COLUMN_NAMES = {"identity", "identity_id", "person_id", "subject_id", "class_id", "label"}
+IMAGE_COLUMN_NAMES = {"image_id", "image", "filename", "file", "path"}
+
+
+def _looks_like_identity_csv(path: Path) -> bool:
+    try:
+        with path.open(newline="") as f:
+            reader = csv.DictReader(f)
+            fields = {field.strip().lower() for field in (reader.fieldnames or [])}
+    except (OSError, UnicodeDecodeError, csv.Error):
+        return False
+    return bool(fields & IMAGE_COLUMN_NAMES) and bool(fields & IDENTITY_COLUMN_NAMES)
+
+
 def find_identity_file(data_dir: Path) -> Path | None:
     candidates = [
         data_dir / "identity_CelebA.txt",
@@ -28,7 +42,26 @@ def find_identity_file(data_dir: Path) -> Path | None:
     for path in candidates:
         if path.exists():
             return path
+    for path in sorted(data_dir.glob("*.csv")):
+        if _looks_like_identity_csv(path):
+            return path
     return None
+
+
+def describe_available_label_files(data_dir: Path) -> str:
+    lines = []
+    for path in sorted(data_dir.glob("*.csv")):
+        try:
+            with path.open(newline="") as f:
+                reader = csv.DictReader(f)
+                fields = reader.fieldnames or []
+        except (OSError, UnicodeDecodeError, csv.Error):
+            fields = []
+        preview = ", ".join(fields[:8])
+        if len(fields) > 8:
+            preview += ", ..."
+        lines.append(f"{path.name}: {preview}")
+    return "; ".join(lines) if lines else "no CSV files found"
 
 
 def read_partitions(paths: Paths) -> dict[str, int]:
@@ -44,7 +77,9 @@ def read_identities(data_dir: Path) -> dict[str, int]:
     if path is None:
         raise FileNotFoundError(
             "CelebA identity labels are required for identity retrieval/ArcFace training. "
-            "Put identity_CelebA.txt or identity_CelebA.csv under data/celeba/."
+            "The CSV files currently under data/celeba do not contain an identity/person_id column. "
+            f"Found: {describe_available_label_files(data_dir)}. "
+            "Put identity_CelebA.txt or a CSV with image_id and identity columns under data/celeba/."
         )
 
     identities: dict[str, int] = {}
@@ -53,8 +88,10 @@ def read_identities(data_dir: Path) -> dict[str, int]:
         f.seek(0)
         if "," in sample:
             reader = csv.DictReader(f)
-            image_key = "image_id" if "image_id" in (reader.fieldnames or []) else (reader.fieldnames or [])[0]
-            id_key = "identity" if "identity" in (reader.fieldnames or []) else (reader.fieldnames or [])[1]
+            fieldnames = reader.fieldnames or []
+            lower_to_field = {field.strip().lower(): field for field in fieldnames}
+            image_key = next((lower_to_field[name] for name in IMAGE_COLUMN_NAMES if name in lower_to_field), fieldnames[0])
+            id_key = next((lower_to_field[name] for name in IDENTITY_COLUMN_NAMES if name in lower_to_field), fieldnames[1])
             for row in reader:
                 identities[row[image_key]] = int(row[id_key])
         else:
@@ -65,14 +102,30 @@ def read_identities(data_dir: Path) -> dict[str, int]:
     return identities
 
 
+def read_landmarks(data_dir: Path) -> dict[str, list[list[float]]]:
+    path = data_dir / "list_landmarks_align_celeba.csv"
+    if not path.exists():
+        raise FileNotFoundError(f"CelebA aligned landmark file not found: {path}")
+    out: dict[str, list[list[float]]] = {}
+    with path.open(newline="") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            out[row["image_id"]] = [
+                [float(row["lefteye_x"]), float(row["lefteye_y"])],
+                [float(row["righteye_x"]), float(row["righteye_y"])],
+                [float(row["nose_x"]), float(row["nose_y"])],
+                [float(row["leftmouth_x"]), float(row["leftmouth_y"])],
+                [float(row["rightmouth_x"]), float(row["rightmouth_y"])],
+            ]
+    return out
+
+
 def load_records(paths: Paths, require_identity: bool = False, check_exists: bool = False) -> list[CelebARecord]:
     partitions = read_partitions(paths)
     identities = read_identities(paths.data_dir) if require_identity else {}
     records: list[CelebARecord] = []
     for image_id, partition in partitions.items():
         image_path = paths.image_dir / image_id
-        if not image_path.exists():
-            continue
         identity = identities.get(image_id)
         if require_identity and identity is None:
             continue

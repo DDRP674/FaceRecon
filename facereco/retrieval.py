@@ -11,6 +11,15 @@ from .config import Paths
 from .embedding import load_embedding_table
 
 
+def _chunked_topk(q: torch.Tensor, g: torch.Tensor, k: int, chunk_size: int = 512) -> torch.Tensor:
+    chunks = []
+    kk = min(k, g.shape[0])
+    for start in range(0, q.shape[0], chunk_size):
+        sims = q[start : start + chunk_size] @ g.T
+        chunks.append(sims.topk(k=kk, dim=1).indices.cpu())
+    return torch.cat(chunks, dim=0)
+
+
 def evaluate_retrieval(
     paths: Paths,
     query_split: str = "test",
@@ -41,15 +50,21 @@ def evaluate_retrieval(
 
     q = F.normalize(embs[q_idx], dim=1)
     g = F.normalize(embs[g_idx], dim=1)
-    sims = q @ g.T
-    if same_split_self:
-        for row, original_idx in enumerate(q_idx):
-            same = (g_idx == original_idx).nonzero(as_tuple=False).flatten()
-            if len(same):
-                sims[row, same[0]] = -10.0
-
     max_k = max(topk)
-    nn = sims.topk(k=min(max_k, sims.shape[1]), dim=1).indices
+    if same_split_self:
+        chunks = []
+        kk = min(max_k, g.shape[0])
+        for start in range(0, q.shape[0], 512):
+            end = min(start + 512, q.shape[0])
+            sims = q[start:end] @ g.T
+            for row, original_idx in enumerate(q_idx[start:end]):
+                same = (g_idx == original_idx).nonzero(as_tuple=False).flatten()
+                if len(same):
+                    sims[row, same[0]] = -10.0
+            chunks.append(sims.topk(k=kk, dim=1).indices.cpu())
+        nn = torch.cat(chunks, dim=0)
+    else:
+        nn = _chunked_topk(q, g, max_k)
     q_labels = identities[q_idx]
     g_labels = identities[g_idx]
     metrics: dict[str, float] = {
@@ -65,4 +80,3 @@ def evaluate_retrieval(
         out_json.parent.mkdir(parents=True, exist_ok=True)
         out_json.write_text(json.dumps(metrics, indent=2, sort_keys=True))
     return metrics
-

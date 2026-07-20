@@ -27,6 +27,26 @@ def _is_complete(out: Path) -> bool:
     return bool(payload.get("complete", True))
 
 
+def _complete_marker(paths: Paths, image_size: int, batch_size: int, num_records: int) -> Path:
+    return paths.latents_dir / f"sdxl_vae_{image_size}_bs{batch_size}_n{num_records}.complete"
+
+
+def _expected_num_shards(num_records: int, batch_size: int) -> int:
+    return (num_records + batch_size - 1) // batch_size
+
+
+def _has_complete_cache(paths: Paths, image_size: int, batch_size: int, num_records: int) -> bool:
+    marker = _complete_marker(paths, image_size, batch_size, num_records)
+    if marker.exists():
+        return True
+    expected = _expected_num_shards(num_records, batch_size)
+    files = list(paths.latents_dir.glob(f"sdxl_vae_{image_size}_shard_*.pt"))
+    if len(files) >= expected:
+        marker.write_text(f"complete\nimage_size={image_size}\nbatch_size={batch_size}\nnum_records={num_records}\n")
+        return True
+    return False
+
+
 def cache_sdxl_vae_latents(
     records: list[CelebARecord],
     paths: Paths,
@@ -36,6 +56,11 @@ def cache_sdxl_vae_latents(
     dtype: torch.dtype = torch.float16,
     overwrite: bool = False,
 ) -> None:
+    paths.latents_dir.mkdir(parents=True, exist_ok=True)
+    if not overwrite and _has_complete_cache(paths, image_size, batch_size, len(records)):
+        print(f"SDXL VAE latents already cached for {len(records)} records; skipping.", flush=True)
+        return
+
     from diffusers import AutoencoderKL
 
     vae = AutoencoderKL.from_pretrained(paths.realvisxl_path / "vae", torch_dtype=dtype).to(device)
@@ -48,7 +73,6 @@ def cache_sdxl_vae_latents(
             transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5]),
         ]
     )
-    paths.latents_dir.mkdir(parents=True, exist_ok=True)
     progress = progress_bar(total=len(records), desc=f"stage0 SDXL VAE latents {image_size}")
     for start in range(0, len(records), batch_size):
         shard_idx = start // batch_size
@@ -83,3 +107,7 @@ def cache_sdxl_vae_latents(
         )
         progress.update(len(chunk))
     progress.close()
+    if _has_complete_cache(paths, image_size, batch_size, len(records)):
+        _complete_marker(paths, image_size, batch_size, len(records)).write_text(
+            f"complete\nimage_size={image_size}\nbatch_size={batch_size}\nnum_records={len(records)}\n"
+        )

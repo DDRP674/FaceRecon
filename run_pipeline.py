@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 from pathlib import Path
 
 from facereco.celeba import write_split_manifest
@@ -37,13 +38,20 @@ def main() -> None:
     p = sub.add_parser("stage0")
     p.add_argument("--batch-size", type=int, default=512)
     p.add_argument("--ctx-id", type=int, default=0)
+    p.add_argument("--det-size", type=int, default=320)
     p.add_argument("--overwrite", action="store_true")
     p.add_argument("--save-every", type=int, default=8)
+    p.add_argument("--embedding-mode", choices=["landmarks", "fast", "full"], default="landmarks")
+    p.add_argument("--recognition-batch-size", type=int, default=2048)
+    p.add_argument("--preprocess-workers", type=int, default=1)
+    p.add_argument("--num-data-shards", type=int, default=1)
+    p.add_argument("--data-shard-index", type=int, default=0)
     p.add_argument("--skip-embeddings", action="store_true")
     p.add_argument("--cache-vae", action="store_true")
     p.add_argument("--vae-batch-size", type=int, default=16)
     p.add_argument("--vae-image-size", type=int, default=512)
     p.add_argument("--device", default="cuda")
+    p.add_argument("--limit", type=int, default=None)
 
     p = sub.add_parser("export-level")
     p.add_argument("--level", type=int, default=0)
@@ -95,14 +103,32 @@ def main() -> None:
         from facereco.vae_cache import cache_sdxl_vae_latents
 
         records = load_records(paths, require_identity=False)
+        if args.limit is not None:
+            records = records[: args.limit]
+        shard_index_offset = 0
+        if args.num_data_shards < 1:
+            raise ValueError("--num-data-shards must be >= 1")
+        if not (0 <= args.data_shard_index < args.num_data_shards):
+            raise ValueError("--data-shard-index must be in [0, num_data_shards)")
+        if args.num_data_shards > 1:
+            total_batches = math.ceil(len(records) / args.batch_size)
+            batch_start = total_batches * args.data_shard_index // args.num_data_shards
+            batch_end = total_batches * (args.data_shard_index + 1) // args.num_data_shards
+            records = records[batch_start * args.batch_size : min(len(records), batch_end * args.batch_size)]
+            shard_index_offset = batch_start
         if not args.skip_embeddings:
             compute_multinoise_embeddings(
                 records,
                 paths,
                 batch_size=args.batch_size,
                 ctx_id=args.ctx_id,
+                det_size=args.det_size,
                 overwrite=args.overwrite,
                 save_every=args.save_every,
+                embedding_mode=args.embedding_mode,
+                recognition_batch_size=args.recognition_batch_size,
+                preprocess_workers=args.preprocess_workers,
+                shard_index_offset=shard_index_offset,
             )
         if args.cache_vae:
             cache_sdxl_vae_latents(
@@ -129,7 +155,7 @@ def main() -> None:
             gen_dir = generate_from_embedding_file(paths, emb, out_dir=gen_dir, limit=args.limit)
         if args.evaluate:
             out = paths.metrics_dir / f"{args.cmd}_reconstruction.json"
-            print(json.dumps(evaluate_reconstructions(paths, gen_dir, out_json=out), indent=2))
+            print(json.dumps(evaluate_reconstructions(paths, gen_dir, limit=args.limit, out_json=out), indent=2))
     elif args.cmd == "stage3":
         from facereco.defense_train import train_defense
 

@@ -12,8 +12,14 @@ from .config import Paths
 from .embedding import embed_image_bgr, load_face_app
 
 
-DEFAULT_PROMPT = "A closeup portrait photo of a person, natural lighting, realistic skin texture"
-DEFAULT_NEGATIVE = "monochrome, lowres, bad anatomy, worst quality, low quality, blurry"
+DEFAULT_PROMPT = (
+    "A centered realistic head-and-shoulders portrait photo of one person, "
+    "full face fully visible, entire head visible, natural lighting, realistic skin texture"
+)
+DEFAULT_NEGATIVE = (
+    "cropped face, partial face, cut off head, out of frame, extreme closeup, "
+    "monochrome, lowres, bad anatomy, worst quality, low quality, blurry"
+)
 
 
 def load_ip_adapter(paths: Paths, device: str = "cuda"):
@@ -53,7 +59,10 @@ def generate_from_embedding_file(
     negative_prompt: str = DEFAULT_NEGATIVE,
 ) -> Path:
     records = load_records(paths, require_identity=False)
-    split_ids = {r.image_id for r in records if r.split == split}
+    split_image_ids = [r.image_id for r in records if r.split == split]
+    if limit is not None:
+        split_image_ids = split_image_ids[:limit]
+    split_ids = set(split_image_ids)
     payload = torch.load(embedding_file, map_location="cpu")
     image_ids: list[str] = payload["image_ids"]
     embeddings: torch.Tensor = payload["embeddings"].float()
@@ -66,6 +75,9 @@ def generate_from_embedding_file(
             continue
         out_path = out_dir / image_id
         if out_path.exists():
+            count += 1
+            if limit is not None and count >= limit:
+                break
             continue
         faceid_embeds = emb.unsqueeze(0).to(device=device, dtype=torch.float16)
         images = ip_model.generate(
@@ -90,6 +102,7 @@ def evaluate_reconstructions(
     paths: Paths,
     generated_dir: Path,
     split: str = "test",
+    limit: int | None = None,
     device: str = "cuda",
     out_json: Path | None = None,
 ) -> dict[str, float]:
@@ -97,6 +110,8 @@ def evaluate_reconstructions(
     from transformers import CLIPImageProcessor, CLIPModel
 
     records = [r for r in load_records(paths, require_identity=False) if r.split == split]
+    if limit is not None:
+        records = records[:limit]
     app = load_face_app(ctx_id=0 if device.startswith("cuda") else -1)
     clip_model = CLIPModel.from_pretrained("openai/clip-vit-large-patch14").to(device).eval()
     clip_processor = CLIPImageProcessor.from_pretrained("openai/clip-vit-large-patch14")
