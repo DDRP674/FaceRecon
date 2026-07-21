@@ -97,6 +97,7 @@ def main() -> None:
 
     p = sub.add_parser("stage5")
     p.add_argument("--embedding-file", required=True)
+    p.add_argument("--val-embedding-file", default=None)
     p.add_argument("--eval-embedding-file", default=None)
     p.add_argument("--lora-dir", default=None)
     p.add_argument("--generated-dir", default=None)
@@ -106,7 +107,10 @@ def main() -> None:
     p.add_argument("--height", type=int, default=1024)
     p.add_argument("--prompt", default=None)
     p.add_argument("--negative-prompt", default=None)
+    p.add_argument("--epochs", type=int, default=20)
+    p.add_argument("--steps-per-epoch", type=int, default=None)
     p.add_argument("--steps", type=int, default=1000)
+    p.add_argument("--val-batches", type=int, default=50)
     p.add_argument("--batch-size", type=int, default=1)
     p.add_argument("--lr", type=float, default=1e-4)
     p.add_argument("--skip-train", action="store_true")
@@ -222,8 +226,11 @@ def main() -> None:
             lora_dir = train_ip_adapter_lora(
                 paths,
                 Path(args.embedding_file),
+                val_embedding_file=Path(args.val_embedding_file) if args.val_embedding_file else None,
                 out_dir=lora_dir,
-                steps=args.steps,
+                epochs=args.epochs,
+                steps_per_epoch=args.steps_per_epoch or args.steps,
+                val_batches=args.val_batches,
                 batch_size=args.batch_size,
                 lr=args.lr,
             )

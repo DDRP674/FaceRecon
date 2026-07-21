@@ -254,28 +254,32 @@ log_step "Exporting original 0 percent buffalo_l embeddings"
 python run_pipeline.py export-level --level 0
 
 if has_identity_labels; then
-  log_step "Stage 1: original retrieval metrics"
-  python run_pipeline.py stage1 --query-split test --gallery-split test --level 0
-
   if has_reconstruction_deps; then
     if [[ ! -f ../work/embeddings/defended_train.pt || ! -f ../work/embeddings/defended_test.pt ]]; then
       echo "Missing defended embeddings. Run Stage 3 export before Stage 5." >&2
       exit 1
     fi
+    if [[ ! -f ../work/embeddings/defended_val.pt ]]; then
+      log_step "Exporting defended validation embeddings for Stage 5 validation"
+      python run_pipeline.py export-defended --ckpt ../work/checkpoints/defense_arcface.pt --split val
+    fi
 
     run_optional "Stage 5: training LoRA, attacking with LoRA, and evaluating reconstruction" \
-      python run_pipeline.py stage5 \
-      --embedding-file ../work/embeddings/defended_train.pt \
-      --eval-embedding-file ../work/embeddings/defended_test.pt \
-      --lora-dir ../work/checkpoints/ip_adapter_defended_lora \
-      --generated-dir ../work/generated/stage5_test200_768x1024 \
-      --metrics-out ../work/metrics/stage5_reconstruction.json \
+  python run_pipeline.py stage5 \
+    --embedding-file ../work/embeddings/defended_train.pt \
+    --val-embedding-file ../work/embeddings/defended_val.pt \
+    --eval-embedding-file ../work/embeddings/defended_test.pt \
+    --lora-dir ../work/checkpoints/ip_adapter_defended_lora_bestval \
+    --generated-dir ../work/generated/stage5_test200_768x1024_bestval \
+    --metrics-out ../work/metrics/stage5_reconstruction_bestval.json \
       --limit 200 \
       --width 768 \
       --height 1024 \
       --prompt "A centered realistic head-and-shoulders portrait photo of one person, full face fully visible, entire head visible, natural lighting, realistic skin texture" \
       --negative-prompt "cropped face, partial face, cut off head, out of frame, extreme closeup, monochrome, lowres, bad anatomy, worst quality, low quality, blurry" \
-      --steps 1000 \
+      --epochs 20 \
+      --steps-per-epoch 1000 \
+      --val-batches 50 \
       --batch-size 1 \
       --lr 1e-4 \
       --generate \
@@ -284,15 +288,15 @@ if has_identity_labels; then
     if [[ -d ../work/generated/stage2_test200_768x1024 && -d ../work/generated/stage4_test200_768x1024 ]]; then
       log_step "Creating GT/Stage2/Stage4/Stage5 comparison sheet"
       python run_pipeline.py compare \
-        --stage2-dir ../work/generated/stage2_test200_768x1024 \
-        --stage4-dir ../work/generated/stage4_test200_768x1024 \
-        --stage5-dir ../work/generated/stage5_test200_768x1024 \
-        --out ../work/comparisons/gt_stage2_stage4_stage5_test200.jpg \
+    --stage2-dir ../work/generated/stage2_test200_768x1024 \
+    --stage4-dir ../work/generated/stage4_test200_768x1024 \
+    --stage5-dir ../work/generated/stage5_test200_768x1024_bestval \
+    --out ../work/comparisons/gt_stage2_stage4_stage5_bestval.jpg \
         --limit 8
     fi
   else
     log_step "Skipping Stage 5 because reconstruction dependencies are not importable"
   fi
 else
-  log_step "Skipping Stage 1/5 because CelebA identity labels are missing"
+  log_step "Skipping Stage 5 because CelebA identity labels are missing"
 fi
