@@ -13,16 +13,24 @@ from .embedding import embed_image_bgr, load_face_app
 
 
 DEFAULT_PROMPT = (
+    "A centered realistic half-body portrait photo of one person, upper body visible from head to waist, "
+    "full face fully visible, entire head and shoulders visible, natural lighting, realistic skin texture"
+)
+DEFAULT_NEGATIVE = (
+    "cropped face, partial face, face only, cut off head, cut off body, out of frame, extreme closeup, "
+    "monochrome, lowres, bad anatomy, worst quality, low quality, blurry"
+)
+COMPARABLE_PROMPT = (
     "A centered realistic head-and-shoulders portrait photo of one person, "
     "full face fully visible, entire head visible, natural lighting, realistic skin texture"
 )
-DEFAULT_NEGATIVE = (
+COMPARABLE_NEGATIVE = (
     "cropped face, partial face, cut off head, out of frame, extreme closeup, "
     "monochrome, lowres, bad anatomy, worst quality, low quality, blurry"
 )
 
 
-def load_ip_adapter(paths: Paths, device: str = "cuda"):
+def load_ip_adapter(paths: Paths, device: str = "cuda", lora_dir: Path | None = None):
     from diffusers import DDIMScheduler, StableDiffusionXLPipeline
     from ip_adapter.ip_adapter_faceid import IPAdapterFaceIDXL
 
@@ -41,7 +49,13 @@ def load_ip_adapter(paths: Paths, device: str = "cuda"):
         scheduler=scheduler,
         add_watermarker=False,
     )
-    return IPAdapterFaceIDXL(pipe, str(paths.ip_adapter_ckpt), device)
+    ip_model = IPAdapterFaceIDXL(pipe, str(paths.ip_adapter_ckpt), device)
+    if lora_dir is not None:
+        from peft import PeftModel
+
+        ip_model.pipe.unet = PeftModel.from_pretrained(ip_model.pipe.unet, str(lora_dir)).to(device)
+        ip_model.pipe.unet.eval()
+    return ip_model
 
 
 def generate_from_embedding_file(
@@ -50,13 +64,14 @@ def generate_from_embedding_file(
     split: str = "test",
     out_dir: Path | None = None,
     limit: int | None = None,
-    width: int = 512,
-    height: int = 512,
+    width: int = 768,
+    height: int = 1024,
     steps: int = 30,
     seed: int = 2023,
     device: str = "cuda",
     prompt: str = DEFAULT_PROMPT,
     negative_prompt: str = DEFAULT_NEGATIVE,
+    lora_dir: Path | None = None,
 ) -> Path:
     records = load_records(paths, require_identity=False)
     split_image_ids = [r.image_id for r in records if r.split == split]
@@ -68,7 +83,7 @@ def generate_from_embedding_file(
     embeddings: torch.Tensor = payload["embeddings"].float()
     out_dir = out_dir or (paths.generated_dir / embedding_file.stem / split)
     out_dir.mkdir(parents=True, exist_ok=True)
-    ip_model = load_ip_adapter(paths, device=device)
+    ip_model = load_ip_adapter(paths, device=device, lora_dir=lora_dir)
     count = 0
     for image_id, emb in zip(image_ids, embeddings):
         if image_id not in split_ids:

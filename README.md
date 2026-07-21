@@ -91,7 +91,7 @@ python run_pipeline.py stage2 \
 模型结构：十档 embedding 的 softmax 加权和，再接 `512->384->512` MLP（若 buffalo_l 输出维度不是 512，则 hidden 自动取 3/4）。
 
 ```bash
-python run_pipeline.py stage3 --epochs 10 --batch-size 512 --lr 1e-3
+python run_pipeline.py stage3 --epochs 20 --batch-size 512 --lr 1e-3
 ```
 
 checkpoint 默认保存到 `work/checkpoints/defense_arcface.pt`。

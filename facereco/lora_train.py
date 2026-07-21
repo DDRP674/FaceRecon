@@ -102,7 +102,7 @@ def train_ip_adapter_lora(
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=4, pin_memory=True)
     opt = torch.optim.AdamW([p for p in pipe.unet.parameters() if p.requires_grad], lr=lr)
 
-    prompt = ["A closeup portrait photo of a person"] * batch_size
+    prompt = ["A centered realistic half-body portrait photo of one person"] * batch_size
     text_inputs = pipe.tokenizer(prompt, padding="max_length", max_length=pipe.tokenizer.model_max_length, return_tensors="pt")
     text_inputs_2 = pipe.tokenizer_2(prompt, padding="max_length", max_length=pipe.tokenizer_2.model_max_length, return_tensors="pt")
     global_step = 0
@@ -145,4 +145,3 @@ def train_ip_adapter_lora(
 
     pipe.unet.save_pretrained(out_dir)
     return out_dir
-

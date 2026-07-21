@@ -43,7 +43,7 @@ class MultiNoiseEmbeddingDataset(Dataset):
 
 def train_defense(
     paths: Paths,
-    epochs: int = 10,
+    epochs: int = 20,
     batch_size: int = 512,
     lr: float = 1e-3,
     device: str = "cuda",
@@ -107,4 +107,3 @@ def export_defended_embeddings(paths: Paths, ckpt_path: Path, split: str | None 
     out = paths.embeddings_dir / f"defended_{split or 'train'}.pt"
     torch.save({"image_ids": dataset.image_ids, "labels": dataset.labels, "embeddings": torch.cat(outs, dim=0)}, out)
     return out
-
