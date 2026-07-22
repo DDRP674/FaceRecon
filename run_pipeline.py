@@ -76,7 +76,7 @@ def main() -> None:
     p.add_argument("--generated-dir", default=None)
 
     p = sub.add_parser("stage3")
-    p.add_argument("--epochs", type=int, default=20)
+    p.add_argument("--epochs", type=int, default=12)
     p.add_argument("--batch-size", type=int, default=512)
     p.add_argument("--lr", type=float, default=1e-3)
 
@@ -107,7 +107,7 @@ def main() -> None:
     p.add_argument("--height", type=int, default=1024)
     p.add_argument("--prompt", default=None)
     p.add_argument("--negative-prompt", default=None)
-    p.add_argument("--epochs", type=int, default=20)
+    p.add_argument("--epochs", type=int, default=12)
     p.add_argument("--steps-per-epoch", type=int, default=None)
     p.add_argument("--steps", type=int, default=1000)
     p.add_argument("--val-batches", type=int, default=50)

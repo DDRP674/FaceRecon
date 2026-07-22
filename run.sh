@@ -277,7 +277,7 @@ if has_identity_labels; then
       --height 1024 \
       --prompt "A centered realistic head-and-shoulders portrait photo of one person, full face fully visible, entire head visible, natural lighting, realistic skin texture" \
       --negative-prompt "cropped face, partial face, cut off head, out of frame, extreme closeup, monochrome, lowres, bad anatomy, worst quality, low quality, blurry" \
-      --epochs 20 \
+      --epochs 12 \
       --steps-per-epoch 1000 \
       --val-batches 50 \
       --batch-size 1 \

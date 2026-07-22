@@ -157,7 +157,7 @@ def train_ip_adapter_lora(
     out_dir: Path | None = None,
     image_size: int = 512,
     batch_size: int = 1,
-    epochs: int = 20,
+    epochs: int = 12,
     steps_per_epoch: int = 1000,
     val_batches: int = 50,
     lr: float = 1e-4,
@@ -247,6 +247,8 @@ def train_ip_adapter_lora(
         }
         history.append(row)
         print(json.dumps(row), flush=True)
+        (out_dir / "lora_loss_history.json").write_text(json.dumps(history, indent=2))
+        _write_loss_curve(history, out_dir / "lora_loss_curve.png")
 
     (out_dir / "lora_loss_history.json").write_text(json.dumps(history, indent=2))
     _write_loss_curve(history, out_dir / "lora_loss_curve.png")
