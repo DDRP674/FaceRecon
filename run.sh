@@ -269,19 +269,21 @@ if has_identity_labels; then
     --embedding-file ../work/embeddings/defended_train.pt \
     --val-embedding-file ../work/embeddings/defended_val.pt \
     --eval-embedding-file ../work/embeddings/defended_test.pt \
-    --lora-dir ../work/checkpoints/ip_adapter_defended_lora_bestval \
-    --generated-dir ../work/generated/stage5_test200_768x1024_bestval \
-    --metrics-out ../work/metrics/stage5_reconstruction_bestval.json \
+    --lora-dir ../work/checkpoints/ip_adapter_defended_lora_rawimg_bs1_lr5e5_ep20 \
+    --generated-dir ../work/generated/stage5_test200_768x1024_rawimg_bs1_lr5e5_ep20 \
+    --metrics-out ../work/metrics/stage5_reconstruction_rawimg_bs1_lr5e5_ep20.json \
       --limit 200 \
       --width 768 \
       --height 1024 \
       --prompt "A centered realistic head-and-shoulders portrait photo of one person, full face fully visible, entire head visible, natural lighting, realistic skin texture" \
       --negative-prompt "cropped face, partial face, cut off head, out of frame, extreme closeup, monochrome, lowres, bad anatomy, worst quality, low quality, blurry" \
-      --epochs 12 \
+      --epochs 20 \
       --steps-per-epoch 1000 \
       --val-batches 50 \
       --batch-size 1 \
-      --lr 1e-4 \
+      --lr 5e-5 \
+      --max-grad-norm 1.0 \
+      --loss-smooth-window 100 \
       --generate \
       --evaluate
 
@@ -290,8 +292,8 @@ if has_identity_labels; then
       python run_pipeline.py compare \
     --stage2-dir ../work/generated/stage2_test200_768x1024 \
     --stage4-dir ../work/generated/stage4_test200_768x1024 \
-    --stage5-dir ../work/generated/stage5_test200_768x1024_bestval \
-    --out ../work/comparisons/gt_stage2_stage4_stage5_bestval.jpg \
+    --stage5-dir ../work/generated/stage5_test200_768x1024_rawimg_bs1_lr5e5_ep20 \
+    --out ../work/comparisons/gt_stage2_stage4_stage5_rawimg_bs1_lr5e5_ep20.jpg \
         --limit 8
     fi
   else

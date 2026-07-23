@@ -13,12 +13,40 @@ from .celeba import load_records
 from .config import Paths
 
 
+def _atomic_torch_save(payload: dict[str, object], out: Path) -> None:
+    tmp = out.with_suffix(out.suffix + ".tmp")
+    torch.save(payload, tmp)
+    tmp.replace(out)
+
+
 class FaceIdImageDataset(Dataset):
-    def __init__(self, paths: Paths, embedding_file: Path, split: str = "train", image_size: int = 512):
+    def __init__(
+        self,
+        paths: Paths,
+        embedding_file: Path,
+        split: str = "train",
+        image_size: int = 512,
+        use_cached_latents: bool = True,
+    ):
         records = load_records(paths, require_identity=True)
         record_by_id = {r.image_id: r for r in records if r.split == split}
         payload = torch.load(embedding_file, map_location="cpu")
+        self.cache_file = paths.latents_dir / f"stage5_{embedding_file.stem}_{split}_vae{image_size}.pt"
+        emb_by_id = {
+            image_id: emb.float()
+            for image_id, emb in zip(payload["image_ids"], payload["embeddings"])
+            if image_id in record_by_id
+        }
         self.items = []
+        self.latents: torch.Tensor | None = None
+        if use_cached_latents:
+            self._load_cached_latents(paths, emb_by_id, image_size)
+            if len(self.items) == 0:
+                raise RuntimeError(
+                    f"No cached SDXL VAE latents matched {split} embeddings. "
+                    f"Expected files like {paths.latents_dir / f'sdxl_vae_{image_size}_shard_00000.pt'}."
+                )
+            return
         for image_id, emb in zip(payload["image_ids"], payload["embeddings"]):
             record = record_by_id.get(image_id)
             if record is not None:
@@ -32,10 +60,52 @@ class FaceIdImageDataset(Dataset):
             ]
         )
 
+    def _load_cached_latents(self, paths: Paths, emb_by_id: dict[str, torch.Tensor], image_size: int) -> None:
+        if self.cache_file.exists():
+            print(f"Loading Stage 5 latent dataset cache: {self.cache_file}", flush=True)
+            payload = torch.load(self.cache_file, map_location="cpu")
+            self.items = [(image_id, emb.float()) for image_id, emb in zip(payload["image_ids"], payload["embeddings"])]
+            self.latents = payload["latents"].to(dtype=torch.float16).contiguous()
+            return
+
+        shards = sorted(paths.latents_dir.glob(f"sdxl_vae_{image_size}_shard_*.pt"))
+        if not shards:
+            raise RuntimeError(f"Missing cached SDXL VAE latents in {paths.latents_dir}; run Stage 0 VAE cache first.")
+        print(f"Building Stage 5 latent dataset cache from {len(shards)} shards: {self.cache_file}", flush=True)
+        latents = []
+        for shard_idx, shard in enumerate(shards, start=1):
+            if shard_idx == 1 or shard_idx % 1000 == 0 or shard_idx == len(shards):
+                print(f"Stage 5 latent cache scan {shard_idx}/{len(shards)}", flush=True)
+            payload = torch.load(shard, map_location="cpu")
+            shard_ids = payload.get("image_ids", [])
+            shard_latents = payload.get("latents")
+            if shard_latents is None:
+                continue
+            for idx, image_id in enumerate(shard_ids):
+                emb = emb_by_id.get(image_id)
+                if emb is None:
+                    continue
+                self.items.append((image_id, emb))
+                latents.append(shard_latents[idx].to(dtype=torch.float16))
+        if latents:
+            self.latents = torch.stack(latents, dim=0).contiguous()
+            self.cache_file.parent.mkdir(parents=True, exist_ok=True)
+            _atomic_torch_save(
+                {
+                    "image_ids": [image_id for image_id, _emb in self.items],
+                    "embeddings": torch.stack([emb for _image_id, emb in self.items], dim=0),
+                    "latents": self.latents,
+                },
+                self.cache_file,
+            )
+
     def __len__(self) -> int:
         return len(self.items)
 
     def __getitem__(self, idx: int):
+        if self.latents is not None:
+            image_id, emb = self.items[idx]
+            return {"latents": self.latents[idx], "faceid_embeds": emb, "image_id": image_id}
         image_path, image_id, emb = self.items[idx]
         image = Image.open(image_path).convert("RGB")
         return {"pixel_values": self.tfm(image), "faceid_embeds": emb, "image_id": image_id}
@@ -75,18 +145,54 @@ def _encode_prompt(pipe, prompt: list[str], device: str):
     return prompt_embeds, enc2[0]
 
 
-def _batch_loss(pipe, ip_model, scheduler, batch, image_size: int, device: str, prompt_text: str) -> torch.Tensor:
-    pixel_values = batch["pixel_values"].to(device=device, dtype=torch.float16)
+def _get_prompt_condition(
+    pipe,
+    image_size: int,
+    batch_size: int,
+    device: str,
+    prompt_text: str,
+    prompt_cache: dict[int, tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    cached = prompt_cache.get(batch_size)
+    if cached is not None:
+        return cached
+    prompt_embeds, pooled = _encode_prompt(pipe, [prompt_text] * batch_size, device)
+    add_time_ids = torch.tensor([[image_size, image_size, 0, 0, image_size, image_size]], device=device, dtype=torch.float16)
+    add_time_ids = add_time_ids.repeat(batch_size, 1)
+    cached = (prompt_embeds, pooled, add_time_ids)
+    prompt_cache[batch_size] = cached
+    return cached
+
+
+def _batch_loss(
+    pipe,
+    ip_model,
+    scheduler,
+    batch,
+    image_size: int,
+    device: str,
+    prompt_text: str,
+    prompt_cache: dict[int, tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
+) -> torch.Tensor:
     faceid_embeds = batch["faceid_embeds"].to(device=device, dtype=torch.float16)
-    batch_size = pixel_values.shape[0]
     with torch.no_grad():
-        latents = pipe.vae.encode(pixel_values).latent_dist.sample() * pipe.vae.config.scaling_factor
+        if "latents" in batch:
+            latents = batch["latents"].to(device=device, dtype=torch.float16) * pipe.vae.config.scaling_factor
+        else:
+            pixel_values = batch["pixel_values"].to(device=device, dtype=torch.float16)
+            latents = pipe.vae.encode(pixel_values).latent_dist.sample() * pipe.vae.config.scaling_factor
+        batch_size = latents.shape[0]
         noise = torch.randn_like(latents)
         timesteps = torch.randint(0, scheduler.config.num_train_timesteps, (batch_size,), device=device).long()
         noisy_latents = scheduler.add_noise(latents, noise, timesteps)
-        prompt_embeds, pooled = _encode_prompt(pipe, [prompt_text] * batch_size, device)
-        add_time_ids = torch.tensor([[image_size, image_size, 0, 0, image_size, image_size]], device=device, dtype=torch.float16)
-        add_time_ids = add_time_ids.repeat(batch_size, 1)
+        prompt_embeds, pooled, add_time_ids = _get_prompt_condition(
+            pipe,
+            image_size,
+            batch_size,
+            device,
+            prompt_text,
+            prompt_cache,
+        )
 
     if hasattr(ip_model, "get_image_embeds"):
         image_prompt_embeds, _ = ip_model.get_image_embeds(faceid_embeds)
@@ -103,36 +209,64 @@ def _batch_loss(pipe, ip_model, scheduler, batch, image_size: int, device: str, 
     return F.mse_loss(model_pred.float(), noise.float())
 
 
-def _write_loss_curve(history: list[dict[str, float]], out_path: Path) -> None:
+def _read_step_losses(path: Path) -> list[dict[str, float]]:
+    if not path.exists():
+        return []
+    rows = []
+    for line in path.read_text().splitlines():
+        if not line.strip():
+            continue
+        rows.append(json.loads(line))
+    return rows
+
+
+def _smooth(values: list[float], window: int) -> list[float]:
+    if window <= 1 or len(values) <= 2:
+        return values
+    smoothed = []
+    running = 0.0
+    queue: list[float] = []
+    for value in values:
+        queue.append(value)
+        running += value
+        if len(queue) > window:
+            running -= queue.pop(0)
+        smoothed.append(running / len(queue))
+    return smoothed
+
+
+def _write_loss_curve(history: list[dict[str, float]], step_loss_path: Path, out_path: Path, smooth_window: int = 100) -> None:
     width, height = 900, 520
     margin = 60
     image = Image.new("RGB", (width, height), "white")
     draw = ImageDraw.Draw(image)
     draw.line((margin, height - margin, width - margin, height - margin), fill="black", width=2)
     draw.line((margin, margin, margin, height - margin), fill="black", width=2)
-    draw.text((margin, 20), "Stage 5 LoRA loss", fill="black")
-    if not history:
+    draw.text((margin, 20), f"Stage 5 LoRA loss, smoothed window={smooth_window}", fill="black")
+    step_rows = _read_step_losses(step_loss_path)
+    if not step_rows and not history:
         out_path.parent.mkdir(parents=True, exist_ok=True)
         image.save(out_path)
         return
 
-    values = [float(row["train_loss"]) for row in history]
-    values += [float(row["val_loss"]) for row in history if row.get("val_loss") is not None]
+    train_steps = [int(row["global_step"]) for row in step_rows]
+    train_values_raw = [float(row["loss"]) for row in step_rows]
+    train_values = _smooth(train_values_raw, smooth_window)
+    val_steps = [int(row["global_step"]) for row in history if row.get("val_loss") is not None]
+    val_values = [float(row["val_loss"]) for row in history if row.get("val_loss") is not None]
+    values = train_values + val_values
     ymin, ymax = min(values), max(values)
     if ymin == ymax:
         ymax = ymin + 1.0
+    xmax = max(train_steps + val_steps + [1])
 
-    def point(epoch: int, value: float) -> tuple[int, int]:
-        x = margin + int((epoch - 1) * (width - 2 * margin) / max(1, len(history) - 1))
+    def point(step: int, value: float) -> tuple[int, int]:
+        x = margin + int((step - 1) * (width - 2 * margin) / max(1, xmax - 1))
         y = height - margin - int((value - ymin) * (height - 2 * margin) / (ymax - ymin))
         return x, y
 
-    train_pts = [point(int(row["epoch"]), float(row["train_loss"])) for row in history]
-    val_pts = [
-        point(int(row["epoch"]), float(row["val_loss"]))
-        for row in history
-        if row.get("val_loss") is not None
-    ]
+    train_pts = [point(step, value) for step, value in zip(train_steps, train_values)]
+    val_pts = [point(step, value) for step, value in zip(val_steps, val_values)]
     if len(train_pts) > 1:
         draw.line(train_pts, fill="royalblue", width=3)
     if len(val_pts) > 1:
@@ -141,9 +275,9 @@ def _write_loss_curve(history: list[dict[str, float]], out_path: Path) -> None:
         draw.ellipse((x - 3, y - 3, x + 3, y + 3), fill="royalblue")
     for x, y in val_pts:
         draw.ellipse((x - 3, y - 3, x + 3, y + 3), fill="crimson")
-    draw.text((width - 210, margin), "train", fill="royalblue")
+    draw.text((width - 210, margin), "train smoothed", fill="royalblue")
     draw.text((width - 210, margin + 24), "validation", fill="crimson")
-    draw.text((margin, height - margin + 18), "epoch", fill="black")
+    draw.text((margin, height - margin + 18), "global step", fill="black")
     draw.text((8, margin), f"{ymax:.4f}", fill="black")
     draw.text((8, height - margin - 10), f"{ymin:.4f}", fill="black")
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -157,10 +291,14 @@ def train_ip_adapter_lora(
     out_dir: Path | None = None,
     image_size: int = 512,
     batch_size: int = 1,
-    epochs: int = 12,
+    epochs: int = 20,
     steps_per_epoch: int = 1000,
     val_batches: int = 50,
-    lr: float = 1e-4,
+    lr: float = 5e-5,
+    max_grad_norm: float = 1.0,
+    preload_latents_to_gpu: bool = True,
+    use_cached_latents: bool = False,
+    loss_smooth_window: int = 100,
     rank: int = 8,
     alpha: int = 8,
     device: str = "cuda",
@@ -184,22 +322,58 @@ def train_ip_adapter_lora(
     pipe.text_encoder_2.requires_grad_(False)
     pipe.unet.train()
 
-    dataset = FaceIdImageDataset(paths, embedding_file=embedding_file, split="train", image_size=image_size)
+    dataset = FaceIdImageDataset(
+        paths,
+        embedding_file=embedding_file,
+        split="train",
+        image_size=image_size,
+        use_cached_latents=use_cached_latents,
+    )
     if len(dataset) == 0:
         raise RuntimeError("No Stage 5 training pairs found. Export defended train embeddings first.")
-    loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=4, pin_memory=True)
+    if preload_latents_to_gpu and dataset.latents is not None:
+        print(f"Preloading train latents to {device}: {tuple(dataset.latents.shape)}", flush=True)
+        dataset.latents = dataset.latents.to(device=device, non_blocking=True)
+    loader_workers = 0 if dataset.latents is not None else 4
+    loader = DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=loader_workers,
+        pin_memory=dataset.latents is None,
+        drop_last=True,
+    )
     val_loader = None
     if val_embedding_file is not None:
-        val_dataset = FaceIdImageDataset(paths, embedding_file=val_embedding_file, split="val", image_size=image_size)
+        val_dataset = FaceIdImageDataset(
+            paths,
+            embedding_file=val_embedding_file,
+            split="val",
+            image_size=image_size,
+            use_cached_latents=use_cached_latents,
+        )
         if len(val_dataset) == 0:
             raise RuntimeError("No Stage 5 validation pairs found. Export defended val embeddings first.")
-        val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=2, pin_memory=True)
+        if preload_latents_to_gpu and val_dataset.latents is not None:
+            print(f"Preloading validation latents to {device}: {tuple(val_dataset.latents.shape)}", flush=True)
+            val_dataset.latents = val_dataset.latents.to(device=device, non_blocking=True)
+        val_workers = 0 if val_dataset.latents is not None else 2
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=batch_size,
+            shuffle=False,
+            num_workers=val_workers,
+            pin_memory=val_dataset.latents is None,
+        )
     opt = torch.optim.AdamW([p for p in pipe.unet.parameters() if p.requires_grad], lr=lr)
 
     prompt_text = "A centered realistic half-body portrait photo of one person"
+    prompt_cache: dict[int, tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
     best_val = float("inf")
     best_epoch = 0
     history: list[dict[str, float]] = []
+    step_loss_path = out_dir / "lora_step_losses.jsonl"
+    step_loss_path.write_text("")
     global_step = 0
     for epoch in range(1, epochs + 1):
         pipe.unet.train()
@@ -212,11 +386,17 @@ def train_ip_adapter_lora(
             except StopIteration:
                 train_iter = iter(loader)
                 batch = next(train_iter)
-            loss = _batch_loss(pipe, ip_model, scheduler, batch, image_size, device, prompt_text)
+            loss = _batch_loss(pipe, ip_model, scheduler, batch, image_size, device, prompt_text, prompt_cache)
             opt.zero_grad(set_to_none=True)
             loss.backward()
+            if max_grad_norm > 0:
+                torch.nn.utils.clip_grad_norm_([p for p in pipe.unet.parameters() if p.requires_grad], max_grad_norm)
             opt.step()
             global_step += 1
+            step_row = {"epoch": epoch, "global_step": global_step, "loss": loss.item()}
+            with step_loss_path.open("a") as f:
+                f.write(json.dumps(step_row) + "\n")
+                f.flush()
             train_total += loss.item()
             train_count += 1
 
@@ -228,7 +408,7 @@ def train_ip_adapter_lora(
                 for idx, batch in enumerate(val_loader):
                     if idx >= val_batches:
                         break
-                    vals.append(_batch_loss(pipe, ip_model, scheduler, batch, image_size, device, prompt_text).item())
+                    vals.append(_batch_loss(pipe, ip_model, scheduler, batch, image_size, device, prompt_text, prompt_cache).item())
             val_loss = sum(vals) / max(1, len(vals))
             if val_loss < best_val:
                 best_val = val_loss
@@ -248,8 +428,8 @@ def train_ip_adapter_lora(
         history.append(row)
         print(json.dumps(row), flush=True)
         (out_dir / "lora_loss_history.json").write_text(json.dumps(history, indent=2))
-        _write_loss_curve(history, out_dir / "lora_loss_curve.png")
+        _write_loss_curve(history, step_loss_path, out_dir / "lora_loss_curve.png", smooth_window=loss_smooth_window)
 
     (out_dir / "lora_loss_history.json").write_text(json.dumps(history, indent=2))
-    _write_loss_curve(history, out_dir / "lora_loss_curve.png")
+    _write_loss_curve(history, step_loss_path, out_dir / "lora_loss_curve.png", smooth_window=loss_smooth_window)
     return out_dir
