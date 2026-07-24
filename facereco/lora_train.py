@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 from pathlib import Path
 
 import torch
@@ -111,6 +112,41 @@ class FaceIdImageDataset(Dataset):
         return {"pixel_values": self.tfm(image), "faceid_embeds": emb, "image_id": image_id}
 
 
+class FP32MasterAdamW:
+    def __init__(self, params: list[torch.nn.Parameter], lr: float, weight_decay: float = 1e-4, eps: float = 1e-6):
+        self.params = [p for p in params if p.requires_grad]
+        self.master_params = [p.detach().float().clone().requires_grad_(True) for p in self.params]
+        self.opt = torch.optim.AdamW(self.master_params, lr=lr, weight_decay=weight_decay, eps=eps)
+
+    def zero_grad(self) -> None:
+        for param in self.params:
+            param.grad = None
+        self.opt.zero_grad(set_to_none=True)
+
+    def step(self, max_grad_norm: float) -> bool:
+        for param, master in zip(self.params, self.master_params):
+            if param.grad is None:
+                master.grad = None
+                continue
+            grad = param.grad.detach().float()
+            if not torch.isfinite(grad).all():
+                self.opt.zero_grad(set_to_none=True)
+                return False
+            master.grad = grad
+        if max_grad_norm > 0:
+            torch.nn.utils.clip_grad_norm_(self.master_params, max_grad_norm)
+        self.opt.step()
+        with torch.no_grad():
+            for param, master in zip(self.params, self.master_params):
+                if not torch.isfinite(master).all():
+                    for restore_param, restore_master in zip(self.params, self.master_params):
+                        restore_master.copy_(restore_param.detach().float())
+                    self.opt.zero_grad(set_to_none=True)
+                    return False
+                param.copy_(master.to(dtype=param.dtype))
+        return True
+
+
 def _apply_unet_lora(unet, rank: int, alpha: int):
     from peft import LoraConfig, get_peft_model
 
@@ -134,6 +170,22 @@ def _apply_unet_lora(unet, rank: int, alpha: int):
         targets = {"to_q", "to_k", "to_v", "to_out.0"}
     cfg = LoraConfig(r=rank, lora_alpha=alpha, target_modules=sorted(targets), lora_dropout=0.05, bias="none")
     return get_peft_model(unet, cfg)
+
+
+def _adapter_layers(ip_model) -> torch.nn.ModuleList:
+    return torch.nn.ModuleList(ip_model.pipe.unet.attn_processors.values())
+
+
+def _adapter_state_dict(ip_model) -> dict[str, dict[str, torch.Tensor]]:
+    return {
+        "image_proj": ip_model.image_proj_model.state_dict(),
+        "ip_adapter": _adapter_layers(ip_model).state_dict(),
+    }
+
+
+def _save_full_ip_adapter(ip_model, out_dir: Path) -> None:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    torch.save(_adapter_state_dict(ip_model), out_dir / "ip_adapter_full.pt")
 
 
 def _encode_prompt(pipe, prompt: list[str], device: str):
@@ -195,7 +247,7 @@ def _batch_loss(
         )
 
     if hasattr(ip_model, "get_image_embeds"):
-        image_prompt_embeds, _ = ip_model.get_image_embeds(faceid_embeds)
+        image_prompt_embeds = ip_model.image_proj_model(faceid_embeds)
         encoder_hidden_states = torch.cat([prompt_embeds, image_prompt_embeds], dim=1)
     else:
         encoder_hidden_states = prompt_embeds
@@ -242,19 +294,33 @@ def _write_loss_curve(history: list[dict[str, float]], step_loss_path: Path, out
     draw = ImageDraw.Draw(image)
     draw.line((margin, height - margin, width - margin, height - margin), fill="black", width=2)
     draw.line((margin, margin, margin, height - margin), fill="black", width=2)
-    draw.text((margin, 20), f"Stage 5 LoRA loss, smoothed window={smooth_window}", fill="black")
+    draw.text((margin, 20), f"Stage 5 IP-Adapter loss, smoothed window={smooth_window}", fill="black")
     step_rows = _read_step_losses(step_loss_path)
     if not step_rows and not history:
         out_path.parent.mkdir(parents=True, exist_ok=True)
         image.save(out_path)
         return
 
-    train_steps = [int(row["global_step"]) for row in step_rows]
-    train_values_raw = [float(row["loss"]) for row in step_rows]
+    train_pairs = [
+        (int(row["global_step"]), float(row["loss"]))
+        for row in step_rows
+        if row.get("loss") is not None and math.isfinite(float(row["loss"]))
+    ]
+    train_steps = [step for step, _value in train_pairs]
+    train_values_raw = [value for _step, value in train_pairs]
     train_values = _smooth(train_values_raw, smooth_window)
-    val_steps = [int(row["global_step"]) for row in history if row.get("val_loss") is not None]
-    val_values = [float(row["val_loss"]) for row in history if row.get("val_loss") is not None]
+    val_pairs = [
+        (int(row["global_step"]), float(row["val_loss"]))
+        for row in history
+        if row.get("val_loss") is not None and math.isfinite(float(row["val_loss"]))
+    ]
+    val_steps = [step for step, _value in val_pairs]
+    val_values = [value for _step, value in val_pairs]
     values = train_values + val_values
+    if not values:
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        image.save(out_path)
+        return
     ymin, ymax = min(values), max(values)
     if ymin == ymax:
         ymax = ymin + 1.0
@@ -294,13 +360,11 @@ def train_ip_adapter_lora(
     epochs: int = 20,
     steps_per_epoch: int = 1000,
     val_batches: int = 50,
-    lr: float = 5e-5,
+    lr: float = 5e-7,
     max_grad_norm: float = 1.0,
     preload_latents_to_gpu: bool = True,
     use_cached_latents: bool = False,
     loss_smooth_window: int = 100,
-    rank: int = 8,
-    alpha: int = 8,
     device: str = "cuda",
 ) -> Path:
     from diffusers import DDIMScheduler, StableDiffusionXLPipeline
@@ -316,10 +380,15 @@ def train_ip_adapter_lora(
         add_watermarker=False,
     ).to(device)
     ip_model = IPAdapterFaceIDXL(pipe, str(paths.ip_adapter_ckpt), device)
-    pipe.unet = _apply_unet_lora(pipe.unet, rank=rank, alpha=alpha)
+    adapter_layers = _adapter_layers(ip_model)
     pipe.vae.requires_grad_(False)
     pipe.text_encoder.requires_grad_(False)
     pipe.text_encoder_2.requires_grad_(False)
+    pipe.unet.requires_grad_(False)
+    ip_model.image_proj_model.requires_grad_(True)
+    adapter_layers.requires_grad_(True)
+    ip_model.image_proj_model.train()
+    adapter_layers.train()
     pipe.unet.train()
 
     dataset = FaceIdImageDataset(
@@ -365,7 +434,8 @@ def train_ip_adapter_lora(
             num_workers=val_workers,
             pin_memory=val_dataset.latents is None,
         )
-    opt = torch.optim.AdamW([p for p in pipe.unet.parameters() if p.requires_grad], lr=lr)
+    trainable_params = list(ip_model.image_proj_model.parameters()) + list(adapter_layers.parameters())
+    opt = FP32MasterAdamW(trainable_params, lr=lr, weight_decay=1e-4, eps=1e-6)
 
     prompt_text = "A centered realistic half-body portrait photo of one person"
     prompt_cache: dict[int, tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
@@ -387,18 +457,24 @@ def train_ip_adapter_lora(
                 train_iter = iter(loader)
                 batch = next(train_iter)
             loss = _batch_loss(pipe, ip_model, scheduler, batch, image_size, device, prompt_text, prompt_cache)
-            opt.zero_grad(set_to_none=True)
+            if not torch.isfinite(loss):
+                global_step += 1
+                step_row = {"epoch": epoch, "global_step": global_step, "loss": None, "skipped": True}
+                with step_loss_path.open("a") as f:
+                    f.write(json.dumps(step_row) + "\n")
+                    f.flush()
+                continue
+            opt.zero_grad()
             loss.backward()
-            if max_grad_norm > 0:
-                torch.nn.utils.clip_grad_norm_([p for p in pipe.unet.parameters() if p.requires_grad], max_grad_norm)
-            opt.step()
+            stepped = opt.step(max_grad_norm)
             global_step += 1
-            step_row = {"epoch": epoch, "global_step": global_step, "loss": loss.item()}
+            step_row = {"epoch": epoch, "global_step": global_step, "loss": loss.item(), "skipped": not stepped}
             with step_loss_path.open("a") as f:
                 f.write(json.dumps(step_row) + "\n")
                 f.flush()
-            train_total += loss.item()
-            train_count += 1
+            if stepped:
+                train_total += loss.item()
+                train_count += 1
 
         val_loss = None
         if val_loader is not None:
@@ -408,14 +484,16 @@ def train_ip_adapter_lora(
                 for idx, batch in enumerate(val_loader):
                     if idx >= val_batches:
                         break
-                    vals.append(_batch_loss(pipe, ip_model, scheduler, batch, image_size, device, prompt_text, prompt_cache).item())
-            val_loss = sum(vals) / max(1, len(vals))
-            if val_loss < best_val:
+                    value = _batch_loss(pipe, ip_model, scheduler, batch, image_size, device, prompt_text, prompt_cache).item()
+                    if math.isfinite(value):
+                        vals.append(value)
+            val_loss = None if not vals else sum(vals) / len(vals)
+            if val_loss is not None and val_loss < best_val:
                 best_val = val_loss
                 best_epoch = epoch
-                pipe.unet.save_pretrained(out_dir)
+                _save_full_ip_adapter(ip_model, out_dir)
         elif epoch == epochs:
-            pipe.unet.save_pretrained(out_dir)
+            _save_full_ip_adapter(ip_model, out_dir)
 
         row = {
             "epoch": epoch,

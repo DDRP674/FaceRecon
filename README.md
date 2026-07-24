@@ -18,7 +18,7 @@ Stage 3 trains the defense model. The model takes the ten multi-noise embeddings
 
 Stage 4 attacks the defended system directly, using defended embeddings as the IP-Adapter input.
 
-Stage 5 trains a LoRA adapter against defended embeddings and then attacks/evaluates with that adapted generator. The current run configuration uses raw CelebA images rather than cached VAE latents for LoRA training, `batch_size=1`, `lr=5e-5`, `20` epochs, validation-loss checkpoint selection, per-step loss logging, and a smoothed loss curve.
+Stage 5 fine-tunes the full IP-Adapter against defended embeddings and then attacks/evaluates with that adapted generator. The current run configuration uses raw CelebA images rather than cached VAE latents, `batch_size=1`, `lr=1e-6`, `20` epochs, validation-loss checkpoint selection, per-step loss logging, and a smoothed loss curve.
 
 ## Directory Layout
 
@@ -299,7 +299,7 @@ Outputs:
 ../work/metrics/stage4_reconstruction.json
 ```
 
-### 7. Stage 5: Train LoRA Against Defended Embeddings and Evaluate
+### 7. Stage 5: Fine-Tune the Full IP-Adapter Against Defended Embeddings and Evaluate
 
 Current raw-image Stage 5 configuration:
 
@@ -308,9 +308,9 @@ python run_pipeline.py stage5 \
   --embedding-file ../work/embeddings/defended_train.pt \
   --val-embedding-file ../work/embeddings/defended_val.pt \
   --eval-embedding-file ../work/embeddings/defended_test.pt \
-  --lora-dir ../work/checkpoints/ip_adapter_defended_lora_rawimg_bs1_lr5e5_ep20 \
-  --generated-dir ../work/generated/stage5_test200_768x1024_rawimg_bs1_lr5e5_ep20 \
-  --metrics-out ../work/metrics/stage5_reconstruction_rawimg_bs1_lr5e5_ep20.json \
+  --lora-dir ../work/checkpoints/ip_adapter_defended_fulladapter_rawimg_bs1_lr1e6_ep20 \
+  --generated-dir ../work/generated/stage5_test200_768x1024_fulladapter_rawimg_bs1_lr1e6_ep20 \
+  --metrics-out ../work/metrics/stage5_reconstruction_fulladapter_rawimg_bs1_lr1e6_ep20.json \
   --limit 200 \
   --width 768 \
   --height 1024 \
@@ -320,7 +320,7 @@ python run_pipeline.py stage5 \
   --steps-per-epoch 1000 \
   --val-batches 50 \
   --batch-size 1 \
-  --lr 5e-5 \
+  --lr 1e-6 \
   --max-grad-norm 1.0 \
   --loss-smooth-window 100 \
   --generate \
@@ -343,12 +343,12 @@ Stage 5 training details:
 Outputs:
 
 ```text
-../work/checkpoints/ip_adapter_defended_lora_rawimg_bs1_lr5e5_ep20/adapter_model.safetensors
-../work/checkpoints/ip_adapter_defended_lora_rawimg_bs1_lr5e5_ep20/lora_step_losses.jsonl
-../work/checkpoints/ip_adapter_defended_lora_rawimg_bs1_lr5e5_ep20/lora_loss_history.json
-../work/checkpoints/ip_adapter_defended_lora_rawimg_bs1_lr5e5_ep20/lora_loss_curve.png
-../work/generated/stage5_test200_768x1024_rawimg_bs1_lr5e5_ep20/
-../work/metrics/stage5_reconstruction_rawimg_bs1_lr5e5_ep20.json
+../work/checkpoints/ip_adapter_defended_fulladapter_rawimg_bs1_lr1e6_ep20/ip_adapter_full.pt
+../work/checkpoints/ip_adapter_defended_fulladapter_rawimg_bs1_lr1e6_ep20/lora_step_losses.jsonl
+../work/checkpoints/ip_adapter_defended_fulladapter_rawimg_bs1_lr1e6_ep20/lora_loss_history.json
+../work/checkpoints/ip_adapter_defended_fulladapter_rawimg_bs1_lr1e6_ep20/lora_loss_curve.png
+../work/generated/stage5_test200_768x1024_fulladapter_rawimg_bs1_lr1e6_ep20/
+../work/metrics/stage5_reconstruction_fulladapter_rawimg_bs1_lr1e6_ep20.json
 ```
 
 To train Stage 5 from cached VAE latents instead of raw images, add:
@@ -415,8 +415,8 @@ Create a GT / Stage 2 / Stage 4 / Stage 5 comparison sheet:
 python run_pipeline.py compare \
   --stage2-dir ../work/generated/stage2_test200_768x1024 \
   --stage4-dir ../work/generated/stage4_test200_768x1024 \
-  --stage5-dir ../work/generated/stage5_test200_768x1024_rawimg_bs1_lr5e5_ep20 \
-  --out ../work/comparisons/gt_stage2_stage4_stage5_rawimg_bs1_lr5e5_ep20.jpg \
+  --stage5-dir ../work/generated/stage5_test200_768x1024_fulladapter_rawimg_bs1_lr1e6_ep20 \
+  --out ../work/comparisons/gt_stage2_stage4_stage5_fulladapter_rawimg_bs1_lr1e6_ep20.jpg \
   --limit 8
 ```
 
@@ -441,7 +441,7 @@ If buffalo_l is slow, check ONNXRuntime providers. It must include `CUDAExecutio
 
 If `scikit-learn` or `matplotlib` fails with NumPy ABI errors, use `requirements.txt`, which pins `numpy==1.26.4`. The visualization script does not require matplotlib.
 
-If Stage 5 loss is unstable, check the current `--batch-size`, `--lr`, and whether training is using raw images or cached latents. The current raw-image setting is `batch_size=1` and `lr=5e-5`.
+If Stage 5 loss is unstable, check the current `--batch-size`, `--lr`, and whether training is using raw images or cached latents. The current full-adapter raw-image setting is `batch_size=1` and `lr=1e-6`.
 
 If IP-Adapter import fails, make sure `../models/IP-Adapter` exists and that `PYTHONPATH` includes it. `run.sh` handles this automatically.
 

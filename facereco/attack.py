@@ -51,10 +51,19 @@ def load_ip_adapter(paths: Paths, device: str = "cuda", lora_dir: Path | None = 
     )
     ip_model = IPAdapterFaceIDXL(pipe, str(paths.ip_adapter_ckpt), device)
     if lora_dir is not None:
-        from peft import PeftModel
+        full_adapter = Path(lora_dir) / "ip_adapter_full.pt"
+        if full_adapter.exists():
+            state = torch.load(full_adapter, map_location="cpu")
+            ip_model.image_proj_model.load_state_dict(state["image_proj"])
+            ip_layers = torch.nn.ModuleList(ip_model.pipe.unet.attn_processors.values())
+            ip_layers.load_state_dict(state["ip_adapter"])
+            ip_model.image_proj_model.to(device).eval()
+            ip_layers.to(device).eval()
+        else:
+            from peft import PeftModel
 
-        ip_model.pipe.unet = PeftModel.from_pretrained(ip_model.pipe.unet, str(lora_dir)).to(device)
-        ip_model.pipe.unet.eval()
+            ip_model.pipe.unet = PeftModel.from_pretrained(ip_model.pipe.unet, str(lora_dir)).to(device)
+            ip_model.pipe.unet.eval()
     return ip_model
 
 

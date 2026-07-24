@@ -264,14 +264,14 @@ if has_identity_labels; then
       python run_pipeline.py export-defended --ckpt ../work/checkpoints/defense_arcface.pt --split val
     fi
 
-    run_optional "Stage 5: training LoRA, attacking with LoRA, and evaluating reconstruction" \
+    run_optional "Stage 5: fine-tuning full IP-Adapter, attacking, and evaluating reconstruction" \
   python run_pipeline.py stage5 \
     --embedding-file ../work/embeddings/defended_train.pt \
     --val-embedding-file ../work/embeddings/defended_val.pt \
     --eval-embedding-file ../work/embeddings/defended_test.pt \
-    --lora-dir ../work/checkpoints/ip_adapter_defended_lora_rawimg_bs1_lr5e5_ep20 \
-    --generated-dir ../work/generated/stage5_test200_768x1024_rawimg_bs1_lr5e5_ep20 \
-    --metrics-out ../work/metrics/stage5_reconstruction_rawimg_bs1_lr5e5_ep20.json \
+    --lora-dir ../work/checkpoints/ip_adapter_defended_fulladapter_rawimg_bs1_lr5e7_ep20 \
+    --generated-dir ../work/generated/stage5_test200_768x1024_fulladapter_rawimg_bs1_lr5e7_ep20 \
+    --metrics-out ../work/metrics/stage5_reconstruction_fulladapter_rawimg_bs1_lr5e7_ep20.json \
       --limit 200 \
       --width 768 \
       --height 1024 \
@@ -281,19 +281,20 @@ if has_identity_labels; then
       --steps-per-epoch 1000 \
       --val-batches 50 \
       --batch-size 1 \
-      --lr 5e-5 \
+      --lr 5e-7 \
       --max-grad-norm 1.0 \
       --loss-smooth-window 100 \
       --generate \
       --evaluate
 
-    if [[ -d ../work/generated/stage2_test200_768x1024 && -d ../work/generated/stage4_test200_768x1024 ]]; then
+    if [[ -d ../work/generated/stage2_test200_768x1024 && -d ../work/generated/stage4_test200_768x1024 ]] &&
+      find ../work/generated/stage5_test200_768x1024_fulladapter_rawimg_bs1_lr5e7_ep20 -maxdepth 1 -name '*.jpg' -print -quit | grep -q .; then
       log_step "Creating GT/Stage2/Stage4/Stage5 comparison sheet"
       python run_pipeline.py compare \
     --stage2-dir ../work/generated/stage2_test200_768x1024 \
     --stage4-dir ../work/generated/stage4_test200_768x1024 \
-    --stage5-dir ../work/generated/stage5_test200_768x1024_rawimg_bs1_lr5e5_ep20 \
-    --out ../work/comparisons/gt_stage2_stage4_stage5_rawimg_bs1_lr5e5_ep20.jpg \
+    --stage5-dir ../work/generated/stage5_test200_768x1024_fulladapter_rawimg_bs1_lr5e7_ep20 \
+    --out ../work/comparisons/gt_stage2_stage4_stage5_fulladapter_rawimg_bs1_lr5e7_ep20.jpg \
         --limit 8
     fi
   else

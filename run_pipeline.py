@@ -112,7 +112,7 @@ def main() -> None:
     p.add_argument("--steps", type=int, default=1000)
     p.add_argument("--val-batches", type=int, default=50)
     p.add_argument("--batch-size", type=int, default=1)
-    p.add_argument("--lr", type=float, default=5e-5)
+    p.add_argument("--lr", type=float, default=5e-7)
     p.add_argument("--max-grad-norm", type=float, default=1.0)
     p.add_argument("--use-cached-latents", action="store_true")
     p.add_argument("--no-preload-latents-to-gpu", action="store_true")
